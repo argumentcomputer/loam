@@ -231,6 +231,128 @@
 
 (defun ptr-wide-tag (ptr) (widen (ptr-tag ptr)))
 
+#+nil
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  ;; TODO: Any better way to do this?
+  (defun concat-sym (root suf)
+    (intern (format nil "~A~A" root suf))))
+
+;; TODO: Maybe it would be better for this to  belong here? I've copied this over to evaluation.lisp for now.
+#+nil
+(defmacro defmem (prog-name superclasses config &body arg-specs)
+  (multiple-value-bind
+	(signal-args
+	 signal-type-args
+	 digest<-mem-forms
+	 mem<-digest-forms
+	 hash-args
+	 unhash-args
+	 alloc-forms
+	 egress-forms)
+      (loop for arg-spec in arg-specs
+	    for arg = (getf arg-spec :arg)
+	    for arg-tag = (concat-sym arg '-tag)
+	    for arg-value = (concat-sym arg '-value)
+	    for type = (getf arg-spec :type)
+	    for explicit-tag? = (getf arg-spec :tag)
+	    for tag-check-form = (if explicit-tag?
+				     `(when (== (ptr-tag ,arg) (tag-address ,(getf config :tag))))
+				     `(when (== (ptr-tag ,arg) (wide-nth 0 ,arg-tag))))
+	    collect arg into signal-args
+	    collect type into signal-type-args
+	    collect `(ptr-value ,arg ,arg-value) into digest<-mem-forms
+	    when explicit-tag?
+	      collect tag-check-form into digest<-mem-forms
+	    collect `(ptr-value ,arg ,arg-value) into mem<-digest-forms
+	    collect tag-check-form into mem<-digest-forms
+	    when (not explicit-tag?)
+	      collect `(widen (ptr-tag ,arg)) into hash-args
+	      and collect arg-tag into unhash-args
+	    collect arg-value into hash-args
+	    collect arg-value into unhash-args
+	    collect `(alloc (wide-nth 0 ,arg-tag) ,arg-value) into alloc-forms
+	    collect `(egress ,arg) into egress-forms
+	    finally (return (values
+			     signal-args
+			     signal-type-args
+			     digest<-mem-forms
+			     mem<-digest-forms
+			     hash-args
+			     unhash-args
+			     alloc-forms
+			     egress-forms)))
+    (let* ((name (getf config :name))
+	   (tag (getf config :tag))
+	   (initial-addr (getf config :initial-addr))
+	   (hasher (getf config :hasher))
+	   (name-rel (concat-sym name '-rel))
+	   (name-digest-mem (concat-sym name '-digest-mem))
+	   (name-mem (concat-sym name '-mem))
+	   (hash-rel (concat-sym hasher '-rel))
+	   (unhasher (concat-sym 'un hasher))
+	   )
+      `(progn
+	 (defprogram ,prog-name ,superclasses
+	   (include ptr-program)
+	   (include ,hasher)
+	   
+	   ;; Signal.
+	   (relation (,name ,@signal-type-args))
+	   ;; The canonical `name` Ptr relation.
+	   (relation (,name-rel ,@signal-type-args ptr))
+
+	   ;; Memory to support data  allocated by digest or contents.
+	   (lattice (,name-digest-mem wide dual-element)) ; (digest addr)
+	   (lattice (,name-mem ,@signal-type-args dual-element)) ; (args addr)
+
+	   ;; Populating alloc(...) triggers allocation in cons-digest-mem.
+	   (rule (,name-digest-mem ,'value  (alloc ,tag (dual ,initial-addr))) <--
+	     (alloc (tag-address ,tag) ,'value))
+
+	   ;; Populating `name`(...) triggers allocation in name-mem.
+	   (rule (,name-mem ,@signal-args (alloc ,tag (dual ,initial-addr))) <-- (,name ,@signal-args))
+	   
+	   ;; Populate name-digest-mem if a name in cons-mem has been hashed in hash4-rel.
+	   (rule (,name-digest-mem digest addr) <--
+	     (,name-mem ,@signal-args addr)
+	     ,@digest<-mem-forms
+	     (,hash-rel ,@hash-args digest))
+
+	   ;; Other way around.
+	   (rule (,name-mem ,@signal-args addr) <--
+	     (,name-digest-mem digest addr)
+	     (,hash-rel ,@unhash-args digest)
+	     ,@mem<-digest-forms)
+
+	   ;; Register a memory value.
+	   (rule (ptr-value ,name value) <--
+	     (,name-digest-mem value addr) (let ((,name (ptr ,tag (dual-value addr))))))
+
+	   ;; Register a memory relation.
+	   (rule (,name-rel ,@signal-args ,name) <--
+	     (,name-mem ,@signal-args addr)
+	     (let ((,name (ptr ,tag (dual-value addr))))))
+
+	   ;; signal
+	   (rule (,unhasher (tag-address ,tag) digest) <--
+	     (ingress ptr) (when (has-tag-p ptr ,tag)) (ptr-value ptr digest))
+
+	   ;; signal
+	   (rule ,@alloc-forms <--
+	     (,unhasher (tag-address ,tag) digest)
+	     (,hash-rel ,@unhash-args digest))
+
+	   ;; signal
+	   (rule (,hasher (tag-address ,tag) ,@hash-args) <--
+	     (egress ,name)
+	     (,name-rel ,@signal-args ,name)
+	     ,@digest<-mem-forms)
+
+	   ;; signal
+	   (rule ,@egress-forms <--
+	     (egress ,name) (,name-rel ,@signal-args ,name))
+	   )))))
+
 (defprogram ptr-program (lurk-allocation)
   (relation (tag element wide)) ; (short-tag wide-tag)
 
@@ -268,13 +390,13 @@
 ;; hash-cache takes precedence over program in superclass list
 (defprogram hash4 (hash-cache)
   (include ptr-program)
-  (relation (hash4 wide wide wide wide)) ; (a b c d)
-  (relation (unhash4 wide)) ; (digest)
+  (relation (hash4 element wide wide wide wide)) ; (tag a b c d)
+  (relation (unhash4 element wide)) ; (tag digest)
   (relation (hash4-rel wide wide wide wide wide)) ; (a b c d digest)
 
   ;; signal
   (rule (hash4-rel a b c d digest) <--
-    (unhash4 digest)
+    (unhash4 _ digest)
     (let ((preimage (unhash4 digest))
           (a (nth 0 preimage))
           (b (nth 1 preimage))
@@ -282,14 +404,8 @@
           (d (nth 3 preimage)))))
 
   ;; signal
-  (rule (hash4-rel a b c d (hash a b c d)) <-- (hash4 a b c d))
-  
-  ;; signal
-  (rule (alloc a-tag a-value) (alloc b-tag b-value) <--
-    (unhash4 digest)
-    (hash4-rel wide-a-tag a-value wide-b-tag b-value digest)
-    (tag a-tag wide-a-tag)
-    (tag b-tag wide-b-tag)))
+  (rule (hash4-rel a b c d (hash a b c d)) <-- (hash4 _ a b c d))
+  )
 
 (defprogram cons-mem ()
   (include ptr-program)
@@ -297,7 +413,7 @@
 
   ;; The following relations could be determined by something like:
   ;; (constructor cons (:cons 0 hash4) (car ptr) (cdr ptr))
-  ; signal
+  ;; signal
   (relation (cons ptr ptr)) ; (car cdr)
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -311,7 +427,7 @@
   (lattice (cons-mem ptr ptr dual-element)) ; (car cdr addr)
 
   ;; Populating alloc(...) triggers allocation in cons-digest-mem.
-  (rule (cons-digest-mem value  (alloc :cons (dual 0))) <--
+  (rule (cons-digest-mem value (alloc :cons (dual 0))) <--
     (alloc (tag-address :cons) value))
 
   ;; Populating cons(...) triggers allocation in cons-mem.
@@ -321,15 +437,15 @@
   (rule (cons-digest-mem digest addr) <--
     (cons-mem car cdr addr)
     (ptr-value car car-value) (ptr-value cdr cdr-value)
-    (tag (ptr-tag car) car-tag) (tag (ptr-tag cdr) cdr-tag)
-    (hash4-rel car-tag car-value cdr-tag cdr-value digest))
+    (hash4-rel (widen (ptr-tag car)) car-value (widen (ptr-tag cdr)) cdr-value digest))
 
   ;; Other way around.
   (rule (cons-mem car cdr addr) <--
     (cons-digest-mem digest addr)
     (hash4-rel car-tag car-value cdr-tag cdr-value digest)
     (ptr-value car car-value) (ptr-value cdr cdr-value)
-    (tag (ptr-tag car) car-tag) (tag (ptr-tag cdr) cdr-tag))
+    (when (and (== (ptr-tag car) (wide-nth 0 car-tag))
+	       (== (ptr-tag cdr) (wide-nth 0 cdr-tag)))))
 
   ;; Register a cons value.
   (rule (ptr-value cons value) <--
@@ -341,14 +457,18 @@
     (let ((cons (ptr :cons (dual-value addr))))))
 
   ;; signal
-  (rule (unhash4 digest) <--
+  (rule (unhash4 (tag-address :cons) digest) <--
     (ingress ptr) (when (has-tag-p ptr :cons)) (ptr-value ptr digest))
 
   ;; signal
-  (rule (hash4 car-tag car-value cdr-tag cdr-value) <--
+  (rule (alloc (wide-nth 0 car-tag) car-value) (alloc (wide-nth 0 cdr-tag) cdr-value) <--
+    (unhash4 (tag-address :cons) digest)
+    (hash4-rel car-tag car-value cdr-tag cdr-value digest))
+
+  ;; signal
+  (rule (hash4 (tag-address :cons) (widen (ptr-tag car)) car-value (widen (ptr-tag cdr)) cdr-value) <--
     (egress cons)
     (cons-rel car cdr cons)
-    (tag (ptr-tag car) car-tag) (tag (ptr-tag cdr) cdr-tag)
     (ptr-value car car-value) (ptr-value cdr cdr-value))
 
   ;; signal
@@ -434,18 +554,6 @@
 	 (signal-map-double car double-car)
 	 (signal-map-double cdr double-cdr)
 	 (signal-cons double-car double-cdr doubled)))))
-
-  #|
-  (synthesize-rule (signal-map-double ptr doubled) <--
-    (when (has-tag-p ptr :num))
-    (let ((doubled (ptr :num (* 2 (ptr-value ptr)))))))
-  
-  (synthesize-rule (signal-map-double ptr double-cons) <--
-    (ingress-cons car cdr ptr)
-    (signal-map-double car double-car)
-    (signal-map-double cdr double-cdr)
-    (signal-cons double-car double-cdr double-cons)))
-  |#
 
 (defun make-cons (a-tag-spec a-wide b-tag-spec b-wide)
   (hash4 (tag-value a-tag-spec) a-wide (tag-value b-tag-spec) b-wide))
